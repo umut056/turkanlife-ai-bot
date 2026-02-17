@@ -82,12 +82,11 @@ bot.onText(/\/start/, async (msg) => {
   s.profile = {};
   s.habits = {};
 
-  await bot.sendMessage(
-    chatId,
-    "Merhaba 🌿 Ben **TürkanLife Koç Bot**.\n\nSana satış baskısı olmadan, *mini adımlarla* destek olurum.\n\nÖnce hedefini seçelim 👇",
-    { parse_mode: "Markdown", ...startKeyboard() }
-  );
-});
+await bot.sendMessage(
+  chatId,
+  "Merhaba 🌿 Ben Yaşam Koçu Türkan.\n\nBurada kimseye baskı yok, mucize vaat yok.\nSadece sana özel, küçük ama etkili adımlar var.\n\nŞimdi sana odaklanalım 🤍\nBugün hayatında en çok neyi değiştirmek istiyorsun?\n\n✨ Kilo vermek\n⚡ Enerjimi yükseltmek\n🥗 Beslenmemi düzene sokmak\n💬 Sadece konuşmak istiyorum",
+  { ...startKeyboard() }
+);
 
 // Inline buton tıklamaları
 bot.on("callback_query", async (q) => {

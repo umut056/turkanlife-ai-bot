@@ -5,191 +5,150 @@ if (!BOT_TOKEN) throw new Error("BOT_TOKEN env eksik");
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Basit hafıza (Railway yeniden başlarsa sıfırlanır - şimdilik yeterli)
-const sessions = new Map();
+/**
+ * Basit state (RAM)
+ * chatId -> { step: "idle" | "awaiting_form" | "done", goal: string|null, lastStartAt: number }
+ */
+const state = new Map();
 
-// Aşamalar
-const STEP = {
-  WELCOME: "WELCOME",
-  GOAL: "GOAL",
-  TIME: "TIME",
-  IG: "IG",
-  LOCATION: "LOCATION",
-  NAME: "NAME",
-  SURNAME: "SURNAME",
-  EMAIL: "EMAIL",
-  PHONE: "PHONE",
-  DONE: "DONE",
-};
-
-function resetSession(chatId) {
-  sessions.set(chatId, {
-    step: STEP.GOAL,
-    data: {
-      goal: null,
-      time: null,
-      instagram: null,
-      countryCity: null,
-      name: null,
-      surname: null,
-      email: null,
-      phone: null,
-    },
-    // çift tetiklemeyi azaltmak için
-    lastMessageId: null,
-  });
+function getState(chatId) {
+  if (!state.has(chatId)) {
+    state.set(chatId, { step: "idle", goal: null, lastStartAt: 0 });
+  }
+  return state.get(chatId);
 }
 
-function sendWelcome(chatId) {
-  return bot.sendMessage(
-    chatId,
-    "Merhaba, ben Yaşam Koçu Türkan.\nSize nasıl yardımcı olabilirim?",
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Kilo vermek istiyorum", callback_data: "goal:kilo_vermek" }],
-          [{ text: "Kilo almak istiyorum", callback_data: "goal:kilo_almak" }],
-          [{ text: "Sağlıklı beslenme istiyorum", callback_data: "goal:saglikli_beslenme" }],
-          [{ text: "Cilt beslenmesi hakkında bilgi almak istiyorum", callback_data: "goal:cilt" }],
-          [{ text: "İş fırsatı hakkında bilgi almak istiyorum", callback_data: "goal:is_firsati" }],
-        ],
-      },
-    }
-  );
-}
-
-function sendTimeOptions(chatId) {
-  return bot.sendMessage(chatId, "Hangi saat aralığında müsaitsiniz?", {
+function mainMenuKeyboard() {
+  return {
     reply_markup: {
       inline_keyboard: [
-        [{ text: "09:00 – 12:00", callback_data: "time:09-12" }],
-        [{ text: "12:00 – 18:00", callback_data: "time:12-18" }],
-        [{ text: "18:00 ve sonrası", callback_data: "time:18plus" }],
+        [{ text: "Kilo vermek istiyorum", callback_data: "goal:kilo_vermek" }],
+        [{ text: "Kilo almak istiyorum", callback_data: "goal:kilo_almak" }],
+        [{ text: "Sağlıklı beslenmek istiyorum", callback_data: "goal_saglikli_beslenme" }],
       ],
     },
-  });
+  };
 }
 
-function ask(chatId, text) {
-  return bot.sendMessage(chatId, text);
+function normalizeGoal(cb) {
+  // callback_data: goal:kilo_vermek ...
+  if (cb === "goal:kilo_vermek") return "Kilo vermek";
+  if (cb === "goal:kilo_almak") return "Kilo almak";
+  if (cb === "goal_saglikli_beslenme") return "Sağlıklı beslenmek";
+  return null;
 }
 
-// /start her zaman resetlesin
+function formTemplateMessage() {
+  // Tek mesajda doldurtma şablonu
+  return `Ad:
+Soyad:
+E-posta:
+Telefon:`;
+}
+
+function looksLikeFilledForm(text) {
+  // Kullanıcı şablonu tek mesajda doldurmuş mu?
+  // En azından 4 satır ve her biri ":" içeriyor gibi basit kontrol
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+  if (lines.length < 4) return false;
+
+  const keys = ["ad", "soyad", "e-posta", "eposta", "email", "telefon", "tel"];
+  const hasColonLines = lines.filter(l => l.includes(":")).length >= 3;
+
+  const joined = lines.join(" ").toLowerCase();
+  const hasSomeKey = keys.some(k => joined.includes(k));
+
+  return hasColonLines && hasSomeKey;
+}
+
+async function sendWelcome(chatId) {
+  const welcomeText =
+    "Merhaba, ben Yaşam Koçu Türkan.\n" +
+    "Size nasıl yardımcı olabilirim?";
+  await bot.sendMessage(chatId, welcomeText, mainMenuKeyboard());
+}
+
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  resetSession(chatId);
+  const s = getState(chatId);
+
+  // /start spam engeli (2 sn içinde tekrar gelirse ignore)
+  const now = Date.now();
+  if (now - s.lastStartAt < 2000) return;
+  s.lastStartAt = now;
+
+  // Kullanıcı daha önce tamamladıysa bile tekrar /start ile menüyü gösterelim
+  s.step = "idle";
+  s.goal = null;
+
   await sendWelcome(chatId);
 });
 
-// Buton tıklamaları
 bot.on("callback_query", async (q) => {
-  const chatId = q.message.chat.id;
-  const session = sessions.get(chatId) || (resetSession(chatId), sessions.get(chatId));
+  const chatId = q.message?.chat?.id;
+  if (!chatId) return;
 
-  // Aynı callback'e iki kere basılınca tekrarı azalt
-  if (session.lastMessageId === q.id) {
-    return bot.answerCallbackQuery(q.id);
+  const s = getState(chatId);
+  const goal = normalizeGoal(q.data);
+
+  // Telegram "loading" kapansın
+  try { await bot.answerCallbackQuery(q.id); } catch {}
+
+  if (!goal) {
+    // bilinmeyen callback
+    return;
   }
-  session.lastMessageId = q.id;
 
-  const data = q.data || "";
+  s.goal = goal;
+  s.step = "awaiting_form";
 
+  // Menü mesajını istersen düzenleyelim (temiz görünür)
   try {
-    // Telegram "loading" kapat
-    await bot.answerCallbackQuery(q.id);
+    await bot.editMessageReplyMarkup(
+      { inline_keyboard: [] },
+      { chat_id: chatId, message_id: q.message.message_id }
+    );
+  } catch {}
 
-    if (data.startsWith("goal:")) {
-      session.data.goal = data.split(":")[1];
-      session.step = STEP.TIME;
-      await sendTimeOptions(chatId);
-      return;
-    }
-
-    if (data.startsWith("time:")) {
-      session.data.time = data.split(":")[1];
-      session.step = STEP.IG;
-      await ask(chatId, "Instagram kullanıcı adınız?");
-      return;
-    }
-  } catch (e) {
-    console.error("callback_query error:", e);
-  }
+  await bot.sendMessage(chatId, formTemplateMessage());
 });
 
-// Metin mesajları (form alanları)
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
 
-  // komutları burada işleme
-  if (!text || text.startsWith("/")) return;
+  if (!text) return;
+  if (text.startsWith("/")) return; // komutları yukarıda yakalıyoruz
 
-  const session = sessions.get(chatId);
-  // kullanıcı /start demeden yazarsa yine akışı başlat
-  if (!session) {
-    resetSession(chatId);
+  const s = getState(chatId);
+
+  // Eğer kullanıcı henüz hedef seçmediyse: sadece menüye yönlendir
+  if (s.step === "idle") {
     await sendWelcome(chatId);
     return;
   }
 
-  // IG -> LOCATION -> NAME -> SURNAME -> EMAIL -> PHONE
-  try {
-    if (session.step === STEP.IG) {
-      session.data.instagram = text.trim();
-      session.step = STEP.LOCATION;
-      await ask(chatId, "Hangi ülke ve şehirde yaşıyorsunuz?");
+  // Form bekleniyorsa:
+  if (s.step === "awaiting_form") {
+    // Kullanıcı şablonu doldurmadıysa tekrar şablon iste (kısa)
+    if (!looksLikeFilledForm(text)) {
+      await bot.sendMessage(chatId, "Lütfen tek mesajda şu formatla doldur:");
+      await bot.sendMessage(chatId, formTemplateMessage());
       return;
     }
 
-    if (session.step === STEP.LOCATION) {
-      session.data.countryCity = text.trim();
-      session.step = STEP.NAME;
-      await ask(chatId, "Ad");
-      return;
-    }
+    // Burada istersen text'i parse edip bir yere loglayabiliriz.
+    // Şimdilik sadece teşekkür ediyoruz.
+    s.step = "done";
 
-    if (session.step === STEP.NAME) {
-      session.data.name = text.trim();
-      session.step = STEP.SURNAME;
-      await ask(chatId, "Soyad");
-      return;
-    }
+    await bot.sendMessage(chatId, "Teşekkür ederim. En kısa sürede sizinle iletişime geçeceğim.");
+    return;
+  }
 
-    if (session.step === STEP.SURNAME) {
-      session.data.surname = text.trim();
-      session.step = STEP.EMAIL;
-      await ask(chatId, "E-posta");
-      return;
-    }
-
-    if (session.step === STEP.EMAIL) {
-      session.data.email = text.trim();
-      session.step = STEP.PHONE;
-      await ask(chatId, "Telefon");
-      return;
-    }
-
-    if (session.step === STEP.PHONE) {
-      session.data.phone = text.trim();
-      session.step = STEP.DONE;
-
-      await bot.sendMessage(chatId, "Teşekkür ederim.\nEn kısa sürede sizinle iletişime geçeceğim.");
-
-      // İstersen burada bilgileri loglayalım (Railway logs'tan görürsün)
-      console.log("NEW LEAD:", { chatId, ...session.data });
-
-      return;
-    }
-
-    // DONE sonrası yazarsa tekrar menü açalım (isteğe bağlı)
-    if (session.step === STEP.DONE) {
-      resetSession(chatId);
-      await sendWelcome(chatId);
-      return;
-    }
-  } catch (e) {
-    console.error("message flow error:", e);
-    await bot.sendMessage(chatId, "Bir sorun oldu. /start yazar mısınız?");
+  // done durumunda kullanıcı yazarsa: menüye geri al
+  if (s.step === "done") {
+    await sendWelcome(chatId);
+    return;
   }
 });
 

@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "main": "index.js",
   "type": "commonjs",
-  "scripts": { "start": "node index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
-    "node-telegram-bot-api": "^0.61.0",
-    "openai": "^4.0.0"
+    "node-telegram-bot-api": "^0.66.0"
   }
 }

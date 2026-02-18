@@ -2,6 +2,7 @@ const TelegramBot = require("node-telegram-bot-api");
 const OpenAI = require("openai");
 const http = require("http");
 
+// ENV
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const PORT = process.env.PORT || 3000;
@@ -9,7 +10,7 @@ const PORT = process.env.PORT || 3000;
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN env eksik");
 if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY env eksik");
 
-// Railway healthcheck için basit HTTP server
+// Railway healthcheck için HTTP server
 http
   .createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
@@ -17,16 +18,16 @@ http
   })
   .listen(PORT, () => console.log("HTTP server listening on", PORT));
 
-// Bot + OpenAI client
+// Bot + OpenAI
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-// Crash sebeplerini logla (Railway logs’ta göreceksin)
+// Hata yakalama (Railway logs için)
 process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
 process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
 bot.on("polling_error", (err) => console.error("polling_error:", err?.message || err));
 
-// Basit state yönetimi
+// Basit state
 // stages: "idle" | "await_goal" | "await_time" | "await_contact" | "done"
 const sessions = new Map();
 
@@ -85,37 +86,54 @@ async function askContact(chatId) {
   s.stage = "await_contact";
   s.lastPrompt = "contact";
 
-  const msg =
-    "Süper. İletişim bilgilerini tek mesajda yazabilir misin?\n\n" +
-    "Ad:\n" +
-    "Soyad:\n" +
-    "E-posta:\n" +
-    "Telefon:";
-
-  return bot.sendMessage(chatId, msg);
+  return bot.sendMessage(
+    chatId,
+    "Süper 🙂 Telefon numaranı veya e-postanı tek mesajda yazman yeterli."
+  );
 }
 
+// Format zorunlu değil: metinden telefon veya email yakala
 function parseContact(text) {
-  const lines = text
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
+  const raw = (text || "").trim();
 
-  const data = {};
-  for (const line of lines) {
-    const m = line.match(/^(\s*(ad|soyad|e-?posta|telefon)\s*[:\-]?\s*)(.+)$/i);
-    if (m) {
-      const keyRaw = m[2].toLowerCase();
-      const val = m[3].trim();
-      if (keyRaw === "ad") data.ad = val;
-      if (keyRaw === "soyad") data.soyad = val;
-      if (keyRaw === "telefon") data.telefon = val;
-      if (keyRaw.startsWith("e")) data.eposta = val;
-    }
+  // Email
+  const emailMatch = raw.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  const eposta = emailMatch ? emailMatch[0] : null;
+
+  // Telefon (TR için esnek)
+  // örn: 0555 123 45 67 / 05551234567 / +90 555 123 45 67
+  const phoneMatch = raw.match(/(\+?90\s*)?0?\s*(5\d{2})[\s-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}/);
+  const telefon = phoneMatch ? phoneMatch[0].replace(/\s+/g, " ").trim() : null;
+
+  // Ad/Soyad tahmini: email/telefon çıkar, kalan ilk kelimeleri al
+  const cleaned = raw
+    .replace(eposta || "", " ")
+    .replace(telefon || "", " ")
+    .replace(/[^\p{L}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  let ad = null,
+    soyad = null;
+  if (cleaned) {
+    const parts = cleaned.split(" ").filter(Boolean);
+    if (parts.length >= 1) ad = parts[0];
+    if (parts.length >= 2) soyad = parts.slice(1).join(" ");
   }
 
-  const ok = !!(data.ad && (data.telefon || data.eposta));
-  return { ok, data };
+  // Yeterlilik: telefon veya email varsa OK
+  const ok = !!(telefon || eposta);
+
+  return {
+    ok,
+    data: {
+      ad,
+      soyad,
+      eposta,
+      telefon,
+      raw, // ham mesajı da sakla
+    },
+  };
 }
 
 // /start
@@ -124,7 +142,7 @@ bot.onText(/\/start/, async (msg) => {
   await welcome(chatId);
 });
 
-// Inline buton tıklamaları
+// Inline butonlar
 bot.on("callback_query", async (q) => {
   const chatId = q.message?.chat?.id;
   const data = q.data || "";
@@ -132,7 +150,7 @@ bot.on("callback_query", async (q) => {
 
   const s = getSession(chatId);
 
-  // Telegram "loading" hissini kapat
+  // loading kapat
   try {
     await bot.answerCallbackQuery(q.id);
   } catch {}
@@ -158,18 +176,18 @@ bot.on("message", async (msg) => {
   if (!chatId) return;
   if (!text) return;
 
-  // Komutları burada işlemiyoruz (/start zaten onText ile yakalanıyor)
+  // /komutları burada işlemiyoruz
   if (text.startsWith("/")) return;
 
   const s = getSession(chatId);
 
-  // Kullanıcı /start yazmadan mesaj attıysa
+  // /start yazmadan yazdıysa
   if (s.stage === "idle") {
     await welcome(chatId);
     return;
   }
 
-  // Form akışındayken AI'ye gitme
+  // Hedef seçmeden yazarsa
   if (s.stage === "await_goal") {
     if (s.lastPrompt !== "welcome_hint") {
       s.lastPrompt = "welcome_hint";
@@ -179,6 +197,7 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // Saat seçmeden yazarsa
   if (s.stage === "await_time") {
     if (s.lastPrompt !== "time_hint") {
       s.lastPrompt = "time_hint";
@@ -188,13 +207,15 @@ bot.on("message", async (msg) => {
     return;
   }
 
+  // İletişim bekliyorsa: format zorunlu değil
   if (s.stage === "await_contact") {
     const { ok, data } = parseContact(text);
 
     if (!ok) {
+      // sadece kısa hatırlatma
       if (s.lastPrompt !== "contact_retry") {
         s.lastPrompt = "contact_retry";
-        await bot.sendMessage(chatId, "Tek mesajda şu bilgileri yazman yeterli:\nAd:\nSoyad:\nE-posta:\nTelefon:");
+        await bot.sendMessage(chatId, "Telefon numaranı veya e-postanı yazman yeterli 🙂");
       }
       return;
     }
@@ -203,11 +224,11 @@ bot.on("message", async (msg) => {
     s.stage = "done";
     s.lastPrompt = "done";
 
-    await bot.sendMessage(chatId, "Teşekkür ederim 🙏 Bilgilerini aldım. En kısa sürede seninle iletişime geçeceğim.");
+    await bot.sendMessage(chatId, "Teşekkür ederim 🙏 Bilgini aldım. En kısa sürede seninle iletişime geçeceğim.");
     return;
   }
 
-  // Form bitti — AI aktif
+  // Form bitti — AI cevap verebilir
   try {
     await bot.sendChatAction(chatId, "typing");
 
@@ -232,4 +253,4 @@ bot.on("message", async (msg) => {
   }
 });
 
-console.log("Bot çalışıyor 🚀 (polling aktif)");
+console.log("Bot çalışıyor 🚀 (polling + healthcheck)");

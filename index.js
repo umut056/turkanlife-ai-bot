@@ -1,14 +1,30 @@
 const TelegramBot = require("node-telegram-bot-api");
 const OpenAI = require("openai");
+const http = require("http");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const PORT = process.env.PORT || 3000;
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN env eksik");
 if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY env eksik");
 
+// Railway healthcheck için basit HTTP server
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("OK - Telegram bot running");
+  })
+  .listen(PORT, () => console.log("HTTP server listening on", PORT));
+
+// Bot + OpenAI client
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const client = new OpenAI({ apiKey: OPENAI_API_KEY });
+
+// Crash sebeplerini logla (Railway logs’ta göreceksin)
+process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
+process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
+bot.on("polling_error", (err) => console.error("polling_error:", err?.message || err));
 
 // Basit state yönetimi
 // stages: "idle" | "await_goal" | "await_time" | "await_contact" | "done"
@@ -27,7 +43,7 @@ function getSession(chatId) {
   return sessions.get(chatId);
 }
 
-function welcome(chatId) {
+async function welcome(chatId) {
   const s = getSession(chatId);
   s.stage = "await_goal";
   s.goal = null;
@@ -48,27 +64,23 @@ function welcome(chatId) {
   });
 }
 
-function askTime(chatId) {
+async function askTime(chatId) {
   const s = getSession(chatId);
   s.stage = "await_time";
   s.lastPrompt = "time";
 
-  return bot.sendMessage(
-    chatId,
-    "Harika ✅ Görüşmemizi en doğru zamana koyalım: hangi saat aralığı sana daha uygun?",
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "09:00–12:00", callback_data: "TIME:09-12" }],
-          [{ text: "12:00–18:00", callback_data: "TIME:12-18" }],
-          [{ text: "18:00 ve sonrası", callback_data: "TIME:18+" }],
-        ],
-      },
-    }
-  );
+  return bot.sendMessage(chatId, "Harika ✅ Görüşmemizi en doğru zamana koyalım: hangi saat aralığı sana daha uygun?", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "09:00–12:00", callback_data: "TIME:09-12" }],
+        [{ text: "12:00–18:00", callback_data: "TIME:12-18" }],
+        [{ text: "18:00 ve sonrası", callback_data: "TIME:18+" }],
+      ],
+    },
+  });
 }
 
-function askContact(chatId) {
+async function askContact(chatId) {
   const s = getSession(chatId);
   s.stage = "await_contact";
   s.lastPrompt = "contact";
@@ -84,8 +96,10 @@ function askContact(chatId) {
 }
 
 function parseContact(text) {
-  // Esnek: "Ad: Ali" / "Ad Ali" gibi varyasyonları yakalamaya çalışır
-  const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+  const lines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
 
   const data = {};
   for (const line of lines) {
@@ -100,7 +114,6 @@ function parseContact(text) {
     }
   }
 
-  // Minimum kontrol: en az ad + telefon veya eposta gelsin
   const ok = !!(data.ad && (data.telefon || data.eposta));
   return { ok, data };
 }
@@ -113,27 +126,25 @@ bot.onText(/\/start/, async (msg) => {
 
 // Inline buton tıklamaları
 bot.on("callback_query", async (q) => {
-  const chatId = q.message.chat.id;
+  const chatId = q.message?.chat?.id;
   const data = q.data || "";
+  if (!chatId) return;
+
   const s = getSession(chatId);
 
   // Telegram "loading" hissini kapat
-  try { await bot.answerCallbackQuery(q.id); } catch {}
+  try {
+    await bot.answerCallbackQuery(q.id);
+  } catch {}
 
   if (data.startsWith("GOAL:")) {
-    const goal = data.split(":")[1];
-    s.goal = goal;
-
-    // Hedef seçildikten sonra zamanı sor
+    s.goal = data.split(":")[1] || null;
     await askTime(chatId);
     return;
   }
 
   if (data.startsWith("TIME:")) {
-    const timeSlot = data.split(":")[1];
-    s.timeSlot = timeSlot;
-
-    // Saat seçildikten sonra iletişim bilgisi iste
+    s.timeSlot = data.split(":")[1] || null;
     await askContact(chatId);
     return;
   }
@@ -141,22 +152,25 @@ bot.on("callback_query", async (q) => {
 
 // Normal mesajlar
 bot.on("message", async (msg) => {
-  const chatId = msg.chat.id;
+  const chatId = msg.chat?.id;
   const text = msg.text;
-if (!text) return;
-  if (text.startsWith("/")) return; // komutları burada işlemiyoruz
+
+  if (!chatId) return;
+  if (!text) return;
+
+  // Komutları burada işlemiyoruz (/start zaten onText ile yakalanıyor)
+  if (text.startsWith("/")) return;
 
   const s = getSession(chatId);
 
-  // Eğer kullanıcı /start yazmadan mesaj attıysa, direkt karşılama göster
+  // Kullanıcı /start yazmadan mesaj attıysa
   if (s.stage === "idle") {
     await welcome(chatId);
     return;
   }
 
-  // Form aşamasında AI’ye gitme, sadece beklenen alanı işle
+  // Form akışındayken AI'ye gitme
   if (s.stage === "await_goal") {
-    // Butona basması lazım; yazarsa nazikçe yönlendir
     if (s.lastPrompt !== "welcome_hint") {
       s.lastPrompt = "welcome_hint";
       await bot.sendMessage(chatId, "Bir seçenek seçmen yeterli 👇");
@@ -176,14 +190,11 @@ if (!text) return;
 
   if (s.stage === "await_contact") {
     const { ok, data } = parseContact(text);
+
     if (!ok) {
-      // Kuralcı değil, sadece kısa hatırlatma (spam olmasın)
       if (s.lastPrompt !== "contact_retry") {
         s.lastPrompt = "contact_retry";
-        await bot.sendMessage(
-          chatId,
-          "Tek mesajda şu bilgileri yazman yeterli:\nAd:\nSoyad:\nE-posta:\nTelefon:"
-        );
+        await bot.sendMessage(chatId, "Tek mesajda şu bilgileri yazman yeterli:\nAd:\nSoyad:\nE-posta:\nTelefon:");
       }
       return;
     }
@@ -196,11 +207,9 @@ if (!text) return;
     return;
   }
 
-  // Form bitti — istersen burada AI’yi açabiliriz.
-  // Şimdilik basit bırakıyorum: AI’ye sorulsun istiyorsan aşağıdaki bloğu açarız.
-  // ---- AI BLOĞU (opsiyonel) ----
+  // Form bitti — AI aktif
   try {
-    bot.sendChatAction(chatId, "typing");
+    await bot.sendChatAction(chatId, "typing");
 
     const resp = await client.chat.completions.create({
       model: "gpt-4.1-mini",
@@ -208,19 +217,19 @@ if (!text) return;
         {
           role: "system",
           content:
-            "Türkçe konuş. Kısa, net ve ilgili cevap ver. Satış baskısı yapma. Sağlık/tedavi vaadi verme. Kullanıcıyı önemseyen, sıcak ama abartısız bir dil kullan."
+            "Türkçe konuş. Kısa, net ve ilgili cevap ver. Satış baskısı yapma. Sağlık/tedavi vaadi verme. Kullanıcıyı önemseyen, sıcak ama abartısız bir dil kullan.",
         },
-        { role: "user", content: text }
+        { role: "user", content: text },
       ],
-      temperature: 0.7
+      temperature: 0.7,
     });
 
     const answer = resp.choices?.[0]?.message?.content?.trim() || "Tekrar yazar mısın?";
     await bot.sendMessage(chatId, answer);
   } catch (e) {
-    console.error(e);
+    console.error("OpenAI error:", e);
     await bot.sendMessage(chatId, "Şu an cevap veremedim 😕 Biraz sonra tekrar dener misin?");
   }
 });
 
-console.log("Bot çalışıyor 🚀");
+console.log("Bot çalışıyor 🚀 (polling aktif)");
